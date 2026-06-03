@@ -1,0 +1,84 @@
+name: Update built CodeMirror plugin files from parser
+
+on:
+  repository_dispatch:
+    types:
+      - update-from-parser
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update-built-files:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout tiddlywiki-codemirror
+        uses: actions/checkout@v4
+        with:
+          repository: BurningTreeC/tiddlywiki-codemirror
+          path: tiddlywiki-codemirror
+          token: ${{ github.token }}
+
+      - name: Checkout tiddlywiki-codemirror-parser
+        uses: actions/checkout@v4
+        with:
+          repository: BurningTreeC/tiddlywiki-codemirror-parser
+          path: tiddlywiki-codemirror-parser
+          ref: ${{ github.event.client_payload.parser_ref || 'main' }}
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.5.1
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: tiddlywiki-codemirror-parser/pnpm-lock.yaml
+
+      - name: Install parser dependencies
+        working-directory: tiddlywiki-codemirror-parser
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck parser
+        working-directory: tiddlywiki-codemirror-parser
+        run: pnpm run typecheck
+
+      - name: Build directly into tiddlywiki-codemirror plugin folders
+        working-directory: tiddlywiki-codemirror-parser
+        env:
+          TW_PLUGIN_OUTPUT_DIR: ${{ github.workspace }}/tiddlywiki-codemirror/plugins/tiddlywiki
+        run: pnpm run build:plugins
+
+      - name: Verify generated files
+        working-directory: tiddlywiki-codemirror
+        run: |
+          test -f plugins/tiddlywiki/codemirror-6/files/lang-tiddlywiki/lang-tiddlywiki.js
+          test -f plugins/tiddlywiki/codemirror-6/files/editor/lib/codemirror-state.js
+          test -f plugins/tiddlywiki/codemirror-6/files/editor/lib/codemirror-view.js
+          test -f plugins/tiddlywiki/codemirror-6/files/editor/lib/codemirror-language.js
+          test -f plugins/tiddlywiki/codemirror-6/files/editor/lib/codemirror-autocomplete.js
+          test -f plugins/tiddlywiki/codemirror-6/files/editor/lib/codemirror-search.js
+          test -f plugins/tiddlywiki/codemirror-6-lint/files/codemirror-lint.js
+          find plugins/tiddlywiki -type f | sort
+
+      - name: Commit generated files
+        working-directory: tiddlywiki-codemirror
+        run: |
+          if git diff --quiet && git diff --cached --quiet; then
+            echo "No generated file changes to commit."
+            exit 0
+          fi
+
+          PARSER_SHA="$(git -C ../tiddlywiki-codemirror-parser rev-parse --short HEAD)"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add plugins/tiddlywiki
+          git commit -m "Update built CodeMirror files from parser ${PARSER_SHA}"
+          git push
