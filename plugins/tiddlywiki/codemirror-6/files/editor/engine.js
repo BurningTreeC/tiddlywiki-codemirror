@@ -170,6 +170,10 @@ function clamp(n, min, max) {
 	return Math.max(min, Math.min(max, n));
 }
 
+function isComposingInput(view) {
+	return !!(view && (view.composing || view.compositionStarted));
+}
+
 /**
  * Convert TiddlyWiki shortcut format to CodeMirror format
  * TW format: "ctrl-shift-Z" (lowercase modifiers)
@@ -463,21 +467,48 @@ function getPlainTextLanguage() {
 		top: true
 	});
 
-	// Implement the Parser interface with startParse method
-	var plainParser = {
-		startParse: function(input, fragments, ranges) {
-			// Calculate total length from ranges or input
-			var length = 0;
-			if(ranges && ranges.length > 0) {
-				for(var i = 0; i < ranges.length; i++) {
+	function getPlainInputLength(input, ranges) {
+		var length = 0;
+
+		if(ranges && ranges.length > 0) {
+			for(var i = 0; i < ranges.length; i++) {
+				if(ranges[i] && isNumber(ranges[i].to)) {
 					length = Math.max(length, ranges[i].to);
 				}
-			} else {
-				length = input.length;
 			}
+			return length;
+		}
 
-			// Create the final tree immediately
-			var tree = new Tree(docType, [], [], length);
+		if(input && isNumber(input.length)) {
+			return input.length;
+		}
+
+		if(input && input.doc && isNumber(input.doc.length)) {
+			return input.doc.length;
+		}
+
+		if(input !== undefined && input !== null) {
+			return String(input).length;
+		}
+
+		return 0;
+	}
+
+	function createPlainTree(input, ranges) {
+		return new Tree(docType, [], [], getPlainInputLength(input, ranges));
+	}
+
+	// Implement the Parser interface.
+	// CodeMirror itself mainly uses startParse(), but external plugins such as
+	// the minimap may call parser.parse() directly. Provide both methods.
+	var plainParser = {
+		parse: function(input, fragments, ranges) {
+			return createPlainTree(input, ranges);
+		},
+
+		startParse: function(input, fragments, ranges) {
+			var tree = createPlainTree(input, ranges);
+			var length = tree.length;
 
 			// Return a PartialParse that is already done
 			return {
@@ -952,7 +983,8 @@ class CodeMirrorEngine {
 			whitespace: new Compartment(),
 			spellcheck: new Compartment(),
 			bidi: new Compartment(),
-			autocompletion: new Compartment()
+			autocompletion: new Compartment(),
+			languageFallback: new Compartment()
 		};
 
 		// Track registered keymap plugins for dynamic switching
@@ -1170,6 +1202,8 @@ class CodeMirrorEngine {
 		// MUST be before closeBrackets so it gets first chance to handle {
 		if(EditorView.inputHandler) {
 			extensions.push(EditorView.inputHandler.of(function(view, from, to, text) {
+				if(isComposingInput(view)) return false;
+
 				// Only handle single { insertion
 				if(text !== "{") return false;
 
@@ -1217,6 +1251,8 @@ class CodeMirrorEngine {
 		// MUST be before closeBrackets so it gets first chance to handle (
 		if(EditorView.inputHandler) {
 			extensions.push(EditorView.inputHandler.of(function(view, from, to, text) {
+				if(isComposingInput(view)) return false;
+
 				// Only handle ( insertion
 				if(text !== "(") return false;
 
@@ -1277,6 +1313,8 @@ class CodeMirrorEngine {
 		// BUT only when inside a \define block ($(variable)$ is NOT valid in \procedure, \function, \widget)
 		if(EditorView.inputHandler) {
 			extensions.push(EditorView.inputHandler.of(function(view, from, _to, text) {
+				if(isComposingInput(view)) return false;
+
 				// Only trigger on word characters (variable names)
 				if(!/^\w$/.test(text)) return false;
 
@@ -1348,6 +1386,9 @@ class CodeMirrorEngine {
 
 				if(startCompletion && completionStatus) {
 					setTimeout(function() {
+						if(self._destroyed || isComposingInput(view)) {
+							return;
+						}
 						if(completionStatus(view.state) === null) {
 							startCompletion(view);
 						}
@@ -1362,6 +1403,8 @@ class CodeMirrorEngine {
 		// This enables filter/img/ext completion suggestions
 		if(EditorView.inputHandler) {
 			extensions.push(EditorView.inputHandler.of(function(view, from, _to, text) {
+				if(isComposingInput(view)) return false;
+
 				// Only trigger on [ character
 				if(text !== "[") return false;
 
@@ -1387,6 +1430,9 @@ class CodeMirrorEngine {
 
 				if(startCompletion && completionStatus) {
 					setTimeout(function() {
+						if(self._destroyed || isComposingInput(view)) {
+							return;
+						}
 						if(completionStatus(view.state) === null) {
 							startCompletion(view);
 						}
@@ -1428,22 +1474,40 @@ class CodeMirrorEngine {
 			var cursorLayer = layer({
 				above: true,
 				markers: function(view) {
+					if(isComposingInput(view)) {
+						return [];
+					}
+
 					var state = view.state;
+					var docLen = state.doc.length;
 					var cursors = [];
+
 					for(var i = 0; i < state.selection.ranges.length; i++) {
 						var r = state.selection.ranges[i];
+						if(!r) continue;
+
+						var anchor = clamp(r.anchor, 0, docLen);
+						var head = clamp(r.head, 0, docLen);
 						var isPrimary = r === state.selection.main;
 						var cursorClass = isPrimary ? "cm-cursor cm-cursor-primary" : "cm-cursor cm-cursor-secondary";
-						// Draw cursor for this range
-						var cursor = r.empty ? r : EditorSelection.cursor(r.head, r.head > r.anchor ? -1 : 1);
-						var pieces = RectangleMarker.forRange(view, cursorClass, cursor);
-						for(var j = 0; j < pieces.length; j++) {
-							cursors.push(pieces[j]);
+						var cursor = EditorSelection.cursor(head, head > anchor ? -1 : 1);
+
+						try {
+							var pieces = RectangleMarker.forRange(view, cursorClass, cursor);
+							for(var j = 0; j < pieces.length; j++) {
+								cursors.push(pieces[j]);
+							}
+						} catch(_e) {
+							// IME/mobile composition can briefly make DOM selection geometry unstable.
 						}
 					}
+
 					return cursors;
 				},
 				update: function(update, _dom) {
+					if(isComposingInput(update.view)) {
+						return false;
+					}
 					return update.docChanged || update.selectionSet;
 				},
 				"class": "cm-cursorLayer"
@@ -1686,6 +1750,8 @@ class CodeMirrorEngine {
 		var self = this;
 		var cachedAutocompleteData = [{
 			autocomplete: function(context) {
+				if(self._destroyed) return null;
+
 				// Try registered plugin sources first (emoji, snippets, etc.)
 				var sources = self.getCompletionSources();
 				for(var i = 0; i < sources.length; i++) {
@@ -1703,6 +1769,8 @@ class CodeMirrorEngine {
 		}];
 		var emptyData = [];
 		extensions.push(EditorState.languageData.of(function(_state, _pos, _side) {
+			if(self._destroyed) return emptyData;
+
 			var sources = self.getCompletionSources();
 			// Only provide autocomplete if we have sources to offer
 			if(sources.length === 0 && !self._completeAnyWordEnabled) {
@@ -1804,22 +1872,18 @@ class CodeMirrorEngine {
 			} catch (_e) {}
 		}
 
-		// Check if any language plugin is active
-		// If not, add plainTextLanguage as a fallback to prevent undefined syntax tree behavior
-		var hasActiveLanguagePlugin = false;
-		for(var k = 0; k < this._activePlugins.length; k++) {
-			var activePlugin = this._activePlugins[k];
-			if(activePlugin.name && activePlugin.name.indexOf("lang-") === 0) {
-				hasActiveLanguagePlugin = true;
-				break;
-			}
-		}
-		if(!hasActiveLanguagePlugin) {
+		// Global language fallback.
+		// Do not put plaintext languages into inactive language plugin compartments.
+		// Inactive language compartments must stay empty, otherwise external plugins
+		// such as minimap can observe a stale/intermediate parser while switching.
+		var initialLanguageFallback = [];
+		if(!this._hasActiveLanguagePlugin()) {
 			var fallbackLang = getPlainTextLanguage();
 			if(fallbackLang) {
-				extensions.push(fallbackLang);
+				initialLanguageFallback.push(fallbackLang);
 			}
 		}
+		extensions.push(this._compartments.languageFallback.of(initialLanguageFallback));
 
 		// User-provided extensions
 		if(isArray(options.extensions)) {
@@ -2610,17 +2674,32 @@ class CodeMirrorEngine {
 				return null;
 			}
 		} else {
-			// For language compartments, use plain text to clear stale syntax trees.
-			// Empty content is fine for non-language compartments.
-			if(compartmentName && compartmentName.slice(-8) === "Language") {
-				var plainLang = getPlainTextLanguage();
-				if(plainLang) {
-					newContent = [plainLang];
-				}
-			}
+			// Inactive plugin compartments must be empty.
+			// Plaintext fallback is handled by the dedicated global languageFallback
+			// compartment, and only when no lang-* plugin is active at all.
+			newContent = [];
 		}
 
 		return newContent;
+	}
+
+	/**
+	 * Check whether a real language plugin is currently active.
+	 * Used to decide whether the global plaintext fallback should be enabled.
+	 *
+	 * @returns {boolean}
+	 */
+	_hasActiveLanguagePlugin() {
+		if(!this._activePlugins) return false;
+
+		for(var i = 0; i < this._activePlugins.length; i++) {
+			var plugin = this._activePlugins[i];
+			if(plugin && plugin.name && plugin.name.indexOf("lang-") === 0) {
+				return true;
+			}
+		}
+
+		return false;
 	}
 
 	/**
@@ -2688,6 +2767,17 @@ class CodeMirrorEngine {
 					}
 				}
 			}
+		}
+
+		if(this._compartments.languageFallback) {
+			var fallbackContent = [];
+			if(!this._hasActiveLanguagePlugin()) {
+				var fallbackLanguage = getPlainTextLanguage();
+				if(fallbackLanguage) {
+					fallbackContent.push(fallbackLanguage);
+				}
+			}
+			effects.push(this._compartments.languageFallback.reconfigure(fallbackContent));
 		}
 
 		if(effects.length > 0) {
@@ -2874,7 +2964,7 @@ class CodeMirrorEngine {
 	 * @param {Object} plugin - Optional plugin that owns this source (for automatic cleanup)
 	 */
 	registerCompletionSource(source, priority, plugin) {
-		if(!isFunction(source)) return;
+		if(this._destroyed || !this._completionSources || !isFunction(source)) return;
 
 		// Check if already registered (same source and plugin)
 		for(var i = 0; i < this._completionSources.length; i++) {
@@ -2900,6 +2990,8 @@ class CodeMirrorEngine {
 	 * @param {Function} source - The completion source to unregister
 	 */
 	unregisterCompletionSource(source) {
+		if(this._destroyed || !this._completionSources) return;
+
 		for(var i = this._completionSources.length - 1; i >= 0; i--) {
 			if(this._completionSources[i].source === source) {
 				this._completionSources.splice(i, 1);
@@ -2912,7 +3004,8 @@ class CodeMirrorEngine {
 	 * @param {Object} plugin - The plugin whose sources should be unregistered
 	 */
 	unregisterCompletionSourcesForPlugin(plugin) {
-		if(!plugin) return;
+		if(this._destroyed || !this._completionSources || !plugin) return;
+
 		for(var i = this._completionSources.length - 1; i >= 0; i--) {
 			if(this._completionSources[i].plugin === plugin) {
 				this._completionSources.splice(i, 1);
@@ -2925,6 +3018,8 @@ class CodeMirrorEngine {
 	 * @returns {Function[]} Array of completion source functions
 	 */
 	getCompletionSources() {
+		if(this._destroyed || !this._completionSources) return [];
+
 		return this._completionSources.map(function(entry) {
 			return entry.source;
 		});
@@ -3210,6 +3305,9 @@ class CodeMirrorEngine {
 		this._activePlugins = null;
 		this._conditionalPlugins = null;
 		this._allPlugins = null;
+		this._completionSources = [];
+		this._completeAnyWord = null;
+		this._completeAnyWordEnabled = false;
 	}
 
 	isDestroyed() {
